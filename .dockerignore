@@ -3,6 +3,7 @@
 .git/
 .vs/
 .vscode/
+appsettings.Development.json
 .env
 .env.*
 secrets/

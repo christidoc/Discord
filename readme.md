@@ -1,8 +1,6 @@
-docker build -t my-discord-bot .
-docker run --rm \
-  -e DISCORD_TOKEN \
-  my-discord-bot
+## Deploying to Azure
 
-or:
-docker compose up --build -d
-docker compose logs -f discord-bot
+See [docs/azure-deployment.md](docs/azure-deployment.md) for the GitHub Actions
+and Bicep setup for Azure Container Apps. The workflow deploys only from
+`main`; configure the `production` GitHub environment and its OIDC identity
+before enabling deployments.

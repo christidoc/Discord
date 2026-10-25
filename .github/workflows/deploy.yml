@@ -1,0 +1,160 @@
+name: Build and deploy Discord bot
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-bot-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Restore
+        run: dotnet restore MyDiscordBot.csproj
+
+      - name: Test and compile
+        run: dotnet test MyDiscordBot.csproj --configuration Release --no-restore
+
+      - name: Build container image
+        run: docker build --tag mydiscordbot:${GITHUB_SHA} .
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+      AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        shell: bash
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+        run: |
+          set -euo pipefail
+          for name in AZURE_RESOURCE_GROUP AZURE_LOCATION AZURE_ACR_NAME AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Required production environment variable is missing: ${name}" >&2
+              exit 1
+            fi
+          done
+          if [[ -z "$DISCORD_TOKEN" ]]; then
+            echo "Required production environment secret is missing: DISCORD_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Sign in to Azure with GitHub OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy registry and shared infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name "bootstrap-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/bootstrap.bicep \
+            --parameters acrName="$AZURE_ACR_NAME" location="$AZURE_LOCATION" \
+            --only-show-errors \
+            --output none
+
+      - name: Sign in to Azure Container Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          logged_in=false
+          for attempt in $(seq 1 12); do
+            if az acr login --name "$AZURE_ACR_NAME"; then
+              logged_in=true
+              break
+            fi
+            echo "Waiting for ACR authorization to propagate (attempt ${attempt}/12)."
+            sleep 15
+          done
+          if [[ "$logged_in" != "true" ]]; then
+            echo "Could not authenticate to ACR after retries." >&2
+            exit 1
+          fi
+
+      - name: Build and push immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${AZURE_ACR_NAME}.azurecr.io/mydiscordbot:${IMAGE_TAG}"
+          docker build --tag "$image" .
+          docker push "$image"
+
+      - name: Deploy Container App
+        shell: bash
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_TOKEN" ]]; then
+            echo "GitHub environment secret DISCORD_TOKEN is required." >&2
+            exit 1
+          fi
+
+          az deployment group create \
+            --name "app-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters \
+              acrName="$AZURE_ACR_NAME" \
+              containerImageTag="$IMAGE_TAG" \
+              discordToken="$DISCORD_TOKEN" \
+              location="$AZURE_LOCATION" \
+            --only-show-errors \
+            --output none
+
+          for attempt in $(seq 1 30); do
+            status="$(az containerapp show \
+              --name mydiscordbot \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query properties.runningStatus \
+              --output tsv 2>/dev/null || true)"
+            if [[ "$status" == "Running" ]]; then
+              echo "Container App is running."
+              exit 0
+            fi
+            echo "Waiting for Container App to run (attempt ${attempt}/30)."
+            sleep 15
+          done
+
+          echo "Container App did not reach Running state. Check Azure Container Apps logs and replica events." >&2
+          exit 1
