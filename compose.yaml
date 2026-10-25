@@ -1,0 +1,8 @@
+services:
+  discord-bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?Set DISCORD_TOKEN first}
+      DISCORD_TEST_GUILD_ID: ${DISCORD_TEST_GUILD_ID:-}
